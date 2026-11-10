@@ -1,0 +1,83 @@
+name: Build INDword AI Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+concurrency:
+  group: build-windows
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Locate project (unzip if needed)
+        shell: pwsh
+        run: |
+          $dir = $null
+          if ((Test-Path package.json) -and (Test-Path desktop/main.cjs)) {
+            $dir = (Get-Location).Path
+          } else {
+            $zips = Get-ChildItem -Path . -Filter *.zip
+            if (-not $zips) { Write-Error "No .zip file found in the repository root"; exit 1 }
+            $i = 0
+            foreach ($z in $zips) {
+              $i++
+              $out = Join-Path (Get-Location) "_src$i"
+              Expand-Archive -Path $z.FullName -DestinationPath $out -Force
+              $pkgs = Get-ChildItem -Path $out -Recurse -Filter package.json | Where-Object { $_.FullName -notmatch 'node_modules' }
+              foreach ($p in $pkgs) {
+                $j = Get-Content $p.FullName -Raw | ConvertFrom-Json
+                if ($j.name -eq 'indword' -and (Test-Path (Join-Path $p.DirectoryName 'desktop/main.cjs'))) { $dir = $p.DirectoryName; break }
+              }
+              if ($dir) { Write-Host "Using $($z.Name)"; break }
+            }
+          }
+          if (-not $dir) { Write-Error "Could not find the INDword project (with the desktop folder) in the repo or in any zip"; exit 1 }
+          "APP_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install app dependencies
+        working-directory: ${{ env.APP_DIR }}
+        run: npm install --no-audit --no-fund
+
+      - name: Build web app
+        working-directory: ${{ env.APP_DIR }}
+        run: npm run build
+
+      - name: Prepare desktop package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path _desktop | Out-Null
+          Copy-Item "$env:APP_DIR/desktop/main.cjs" _desktop/main.cjs
+          Copy-Item "$env:APP_DIR/desktop/icon.ico" _desktop/icon.ico
+          Copy-Item "$env:APP_DIR/desktop/package.json.template" _desktop/package.json
+          Copy-Item "$env:APP_DIR/dist" _desktop/app -Recurse
+
+      - name: Install desktop tools
+        working-directory: _desktop
+        run: npm install --no-audit --no-fund
+
+      - name: Build Windows installer
+        working-directory: _desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npx electron-builder --win --x64 --publish never
+
+      - name: Upload Windows app
+        uses: actions/upload-artifact@v4
+        with:
+          name: INDword-AI-Windows
+          path: |
+            _desktop/release/*.exe
+          if-no-files-found: error
